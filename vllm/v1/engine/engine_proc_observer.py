@@ -32,4 +32,6 @@ class EngineProcObserver:
                     with contextlib.suppress(Exception):
                         os.kill(pid, 9)
 
+                return
+
             time.sleep(alive_check_interval)
