@@ -1,0 +1,224 @@
+@startuml
+' Skin / style (optional)
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 120
+
+' Participants
+participant Scheduler
+participant "MooncakeConnector\n(Scheduler Role)" as SchedConnector
+participant MooncakeConnectorScheduler as SchedImpl
+participant Worker
+participant "MooncakeConnector\n(Worker Role)" as WorkerConnector
+participant MooncakeConnectorWorker as WorkerImpl
+participant ModelRunner
+participant "KV Cache Manager" as KVManager
+participant "Mooncake TransferEngine" as MooncakeEngine
+participant "Remote Prefiller\n(ZMQ + Mooncake)" as RemotePrefiller
+participant "Remote Decoder\n(ZMQ + Mooncake)" as RemoteDecoder
+
+'===========================
+' Phase 1: Initialization
+'===========================
+== Phase 1: Initialization ==
+rectangle #F0F8FF {
+    Scheduler ->> SchedConnector: ensure_kv_transfer_initialized()\nKVConnectorFactory.create_connector()
+    SchedConnector ->> SchedImpl: __init__(vllm_config, engine_id)
+    note right of SchedImpl
+      Initialize side channel
+      host/port
+    end note
+
+    Worker ->> WorkerConnector: ensure_kv_transfer_initialized()\nKVConnectorFactory.create_connector()
+    WorkerConnector ->> WorkerImpl: __init__(vllm_config, engine_id)
+    WorkerImpl ->> MooncakeEngine: TransferEngine.initialize()\nprotocol="rdma"
+    MooncakeEngine -->> WorkerImpl: rpc_port
+    note right of WorkerImpl
+      Start background threads:
+      - sender_listener
+      - receiver_loop
+    end note
+
+    ModelRunner ->> WorkerConnector: register_kv_caches(kv_caches)
+    WorkerConnector ->> WorkerImpl: register_kv_caches(kv_caches)
+    WorkerImpl ->> MooncakeEngine: batch_register_memory(kv_data_ptrs, kv_data_lens)
+    WorkerImpl ->> WorkerImpl: Start sender listener thread\non side_channel_port
+    note right of WorkerImpl: Background threads ready
+}
+
+'===========================
+' Phase 2: Request Scheduling (Scheduler Side)
+'===========================
+== Phase 2: Request Scheduling (Scheduler Side) ==
+rectangle #FFF8F0 {
+    Scheduler ->> SchedConnector: get_num_new_matched_tokens(request, num_computed_tokens)
+    SchedConnector ->> SchedImpl: get_num_new_matched_tokens()
+
+    alt Remote Prefill Request
+        SchedImpl -->> SchedConnector: (ext_tokens > 0, load_kv_async = true)
+        SchedConnector -->> Scheduler: (ext_tokens, load_kv_async = true)
+    else No Remote Prefill
+        SchedImpl -->> SchedConnector: (0, false)
+        SchedConnector -->> Scheduler: (0, false)
+    end
+
+    Scheduler ->> KVManager: allocate_slots(request, num_new_tokens, ...)
+    KVManager -->> Scheduler: new_blocks
+
+    Scheduler ->> SchedConnector: update_state_after_alloc(request, blocks, num_external_tokens)
+    SchedConnector ->> SchedImpl: update_state_after_alloc()
+
+    alt Remote Prefill (do_remote_prefill = true)
+        SchedImpl ->> SchedImpl: Add to _reqs_need_recv[req_id]\n= (request, local_block_ids)
+    else Remote Decode (do_remote_decode = true)
+        SchedImpl ->> SchedImpl: Add to _reqs_need_send[req_id]\n= []
+    end
+
+    Scheduler ->> SchedConnector: build_connector_meta(scheduler_output)
+    SchedConnector ->> SchedImpl: build_connector_meta()
+    SchedImpl ->> SchedImpl: Create MooncakeConnectorMetadata
+
+    loop For each req in _reqs_need_recv
+        SchedImpl ->> SchedImpl: meta.add_new_req(req_id, block_ids,\nkv_transfer_params, load_remote_cache = true)
+    end
+
+    loop For each req in _reqs_need_send
+        SchedImpl ->> SchedImpl: meta.add_new_req(req_id, block_ids,\nkv_transfer_params = {}, load_remote_cache = false)
+    end
+
+    SchedImpl ->> SchedImpl: Clear _reqs_need_recv and _reqs_need_send
+    SchedImpl -->> SchedConnector: MooncakeConnectorMetadata
+    SchedConnector -->> Scheduler: metadata
+    Scheduler ->> Scheduler: scheduler_output.kv_connector_metadata = metadata
+}
+
+'===========================
+' Phase 3: Model Execution (Worker Side)
+'===========================
+== Phase 3: Model Execution (Worker Side) ==
+rectangle #F0FFF0 {
+    Scheduler ->> ModelRunner: execute_model(scheduler_output)
+    ModelRunner ->> ModelRunner: maybe_get_kv_connector_output(scheduler_output)
+
+    ModelRunner ->> WorkerConnector: bind_connector_metadata(metadata)
+    WorkerConnector ->> WorkerImpl: _connector_metadata = metadata
+
+    ModelRunner ->> WorkerConnector: start_load_kv(forward_context)
+    WorkerConnector ->> WorkerImpl: start_load_kv(metadata)
+
+    par Receive KV (if kv_role != kv_producer)
+        WorkerImpl ->> WorkerImpl: group_kv_pull(metadata)
+
+        loop For each path, req_blocks
+            WorkerImpl ->> WorkerImpl: asyncio.run_coroutine_threadsafe(\nreceive_kv(path, req_blocks), receiver_loop)
+        end
+
+        loop For each receive_kv task
+            WorkerImpl ->> WorkerImpl: Create MooncakeAgentMetadata\n(hostname, rpc_port, req_ids,\nkv_caches_base_addr, block_ids)
+            WorkerImpl ->> RemotePrefiller: ZMQ REQ: send(encoded_metadata)
+            RemotePrefiller -->> WorkerImpl: ZMQ REP: recv() -> TRANS_DONE
+            WorkerImpl ->> WorkerImpl: finished_recving_reqs.update(req_ids)
+        end
+    and Record Send Requests (if kv_role != kv_consumer)
+        WorkerImpl ->> WorkerImpl: asyncio.run_coroutine_threadsafe(\nrecord_send_reqs(metadata), sender_loop)
+
+        loop For each req in metadata.reqs_to_send
+            alt Blocks already allocated
+                WorkerImpl ->> WorkerImpl: Update reqs_need_send[req_id]\nSet ready event
+            else Blocks not yet allocated
+                WorkerImpl ->> WorkerImpl: Create SendBlockMeta\nwith ready event (not set)
+            end
+        end
+    end
+
+    ModelRunner ->> ModelRunner: _model_forward(...)
+    note right of ModelRunner
+      Model executes while
+      KV transfers happen async
+    end note
+
+    ModelRunner ->> WorkerConnector: wait_for_save()
+    note right of WorkerConnector: No-op for Mooncake
+    end note
+
+    ModelRunner ->> WorkerConnector: get_finished(finished_req_ids)
+    WorkerConnector ->> WorkerImpl: get_finished()
+
+    par Fetch Finished Receiving
+        WorkerImpl ->> WorkerImpl: asyncio.run_coroutine_threadsafe(\nfetch_finished_recving_reqs(), receiver_loop)
+        WorkerImpl -->> WorkerImpl: finished_recving_reqs
+    and Fetch Finished Sending
+        WorkerImpl ->> WorkerImpl: asyncio.run_coroutine_threadsafe(\nfetch_finished_sending_reqs(), sender_loop)
+        WorkerImpl ->> WorkerImpl: Check for expired requests
+        WorkerImpl -->> WorkerImpl: finished_sending_reqs
+    end
+
+    WorkerImpl -->> WorkerConnector: (finished_sending, finished_recving)
+    WorkerConnector -->> ModelRunner: KVConnectorOutput
+
+    ModelRunner ->> WorkerConnector: clear_connector_metadata()
+    WorkerConnector ->> WorkerImpl: _connector_metadata = None
+}
+
+'===========================
+' Phase 4: Sending KV (Async, Prefiller Side)
+'===========================
+== Phase 4: Sending KV (Async, Prefiller Side) ==
+rectangle #FFF0F5 {
+    note over RemotePrefiller: Background sender listener thread running
+
+    RemoteDecoder ->> RemotePrefiller: ZMQ REQ: send(MooncakeAgentMetadata)
+    note right of RemotePrefiller
+      Metadata contains:
+      - request_ids
+      - kv_caches_base_addr
+      - block_ids
+    end note
+
+    RemotePrefiller ->> RemotePrefiller: Queue request in sender_worker_queue
+    RemotePrefiller ->> RemotePrefiller: _sender_worker dequeues request
+
+    RemotePrefiller ->> RemotePrefiller: send_kv_to_decode(metadata)
+
+    loop For each req_id in metadata.request_ids
+        RemotePrefiller ->> RemotePrefiller: Get SendBlockMeta from reqs_need_send
+        RemotePrefiller ->> RemotePrefiller: Wait for send_meta.ready event
+    end
+
+    RemotePrefiller ->> RemotePrefiller: _build_transfer_params(send_reqs, metadata)
+
+    loop For each layer, each group of blocks
+        RemotePrefiller ->> RemotePrefiller: Calculate src_ptrs, dst_ptrs, lengths\nGroup contiguous blocks
+    end
+
+    RemotePrefiller ->> MooncakeEngine: batch_transfer_sync_write(\nremote_session, src_ptrs, dst_ptrs, lengths)
+    MooncakeEngine ->> MooncakeEngine: RDMA/Transfer operation
+    MooncakeEngine -->> RemotePrefiller: ret_value (0 = success)
+
+    RemotePrefiller ->> RemotePrefiller: Delete from reqs_need_send
+    RemotePrefiller ->> RemotePrefiller: finished_sending_reqs.update(req_ids)
+    RemotePrefiller -->> RemoteDecoder: ZMQ REP: send(TRANS_DONE)
+}
+
+'===========================
+' Phase 5: Request Completion
+'===========================
+== Phase 5: Request Completion ==
+rectangle #F8F8FF {
+    Scheduler ->> SchedConnector: request_finished(request, block_ids)
+    SchedConnector ->> SchedImpl: request_finished()
+
+    alt Length Capped + Remote Decode
+        SchedImpl ->> SchedImpl: Add to _reqs_need_send[req_id] = block_ids
+        SchedImpl -->> SchedConnector: (delay_free_blocks = true, transfer_params)
+        SchedConnector -->> Scheduler: (true, transfer_params)
+        note right of Scheduler
+          Blocks will be freed
+          after async send completes
+        end note
+    else Normal Finish
+        SchedImpl -->> SchedConnector: (false, null)
+        SchedConnector -->> Scheduler: (false, null)
+    end
+}
+
+@enduml
