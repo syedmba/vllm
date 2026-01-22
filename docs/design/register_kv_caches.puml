@@ -1,0 +1,80 @@
+@startuml
+' Optional theme
+' !theme plain
+
+title KV Transfer Initialization and Registration Flow
+
+actor EngineCore
+participant Executor
+participant Worker
+participant ModelRunner
+participant KVConnector as "MooncakeConnector\n(Worker Role)"
+participant WorkerImpl as "MooncakeConnectorWorker"
+participant MooncakeEngine as "Mooncake TransferEngine"
+participant SenderThread as "Sender Listener Thread"
+
+
+== Phase 1-3: Initialization Setup ==
+note over EngineCore, SenderThread
+Phase 1-3: Initialization Setup
+end note
+
+box "Init (rgb(240, 248, 255))" #F0F8FF
+    EngineCore ->> Executor: initialize_from_config(kv_cache_configs)
+    Executor ->> Worker: collective_rpc("initialize_from_config")
+    Worker ->> Worker: ensure_kv_transfer_initialized()\nCreates MooncakeConnectorWorker
+    Worker ->> WorkerImpl: __init__()\nInitialize TransferEngine
+    WorkerImpl ->> MooncakeEngine: TransferEngine.initialize()\nprotocol="rdma"
+    MooncakeEngine -->> WorkerImpl: rpc_port
+    note right of WorkerImpl
+    Background event loops created
+    (but sender not started yet)
+    end note
+end box
+
+
+== Phase 4-6: KV Cache Creation ==
+note over EngineCore, SenderThread
+Phase 4-6: KV Cache Creation
+end note
+
+box "KV Cache Creation (rgb(255, 250, 240))" #FFFAF0
+    Worker ->> ModelRunner: initialize_kv_cache(kv_cache_config)
+    ModelRunner ->> ModelRunner: initialize_kv_cache_tensors()\nAllocate and reshape tensors
+    ModelRunner -->> Worker: kv_caches: dict[str, torch.Tensor]
+
+    ModelRunner ->> ModelRunner: has_kv_transfer_group()?
+    ModelRunner ->> KVConnector: register_kv_caches(kv_caches)
+end box
+
+
+== Phase 7-8: Registration ==
+note over EngineCore, SenderThread
+Phase 7-8: Registration
+end note
+
+box "Registration (rgb(240, 255, 240))" #F0FFF0
+    KVConnector ->> WorkerImpl: register_kv_caches(kv_caches)
+
+    WorkerImpl ->> WorkerImpl: Iterate through kv_caches\nCollect base addresses
+    loop For each layer
+        WorkerImpl ->> WorkerImpl: Get cache.data_ptr()\nGet cache.nbytes
+        WorkerImpl ->> WorkerImpl: Validate size consistency\nCalculate num_blocks
+    end
+
+    WorkerImpl ->> WorkerImpl: Deduplicate base addresses\nBuild kv_data_ptrs, kv_data_lens
+
+    WorkerImpl ->> MooncakeEngine: batch_register_memory(\nkv_data_ptrs, kv_data_lens)
+    MooncakeEngine -->> WorkerImpl: ret_value (0 = success)
+
+    WorkerImpl ->> WorkerImpl: Calculate block_len\nStore device_kv_caches
+
+    alt kv_role != "kv_consumer"
+        WorkerImpl ->> SenderThread: Start _mooncake_sender_listener()\non side_channel_port
+        SenderThread ->> SenderThread: Create ZMQ ROUTER socket\nListen for transfer requests
+        SenderThread -->> WorkerImpl: ready_event.set()
+        WorkerImpl ->> WorkerImpl: Wait for ready_event
+    end
+end box
+
+@enduml

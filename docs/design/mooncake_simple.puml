@@ -13,7 +13,7 @@ participant "Mooncake TransferEngine" as MooncakeEngine
 participant "Remote Prefiller\n(ZMQ + Mooncake)" as RemotePrefiller
 participant "Remote Decoder\n(ZMQ + Mooncake)" as RemoteDecoder
 
-note over Scheduler, RemoteDecoder: Phase 3: Model Execution (Worker Side)
+note over Scheduler, RemoteDecoder: Phase A: Model Execution (Worker Side)
 
 group Phase A: Model Execution (Worker Side) #LightGreen
     Scheduler -> ModelRunner: execute_model(scheduler_output)
@@ -70,7 +70,7 @@ group Phase A: Model Execution (Worker Side) #LightGreen
     WorkerConnector -> WorkerImpl: _connector_metadata = None
 end
 
-note over Scheduler, RemoteDecoder: Phase 4: Sending KV (Async, Prefiller Side)
+note over Scheduler, RemoteDecoder: Phase B: Sending KV (Async, Prefiller Side)
 
 group Phase B: Sending KV (Async, Prefiller Side) #MistyRose
     note over RemotePrefiller: Background sender listener thread running
